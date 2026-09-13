@@ -1,0 +1,16 @@
+# Ключи и личное — в публичный репозиторий не попадает
+config.yaml
+voices/*.wav
+voices/*.mp3
+voices/*.flac
+voices/*.m4a
+voices/*.ogg
+voices/*.txt
+!voices/README.txt
+
+# Результаты работы и мусор
+output/
+__pycache__/
+*.pyc
+1.txt
+tema_ru.txt

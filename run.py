@@ -286,6 +286,17 @@ def write_report(report, path):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# Сообщения Vast, означающие, что машина не запустится: беда хоста, ждать бессмысленно
+DEAD_MSG = (
+    "error response from daemon",        # docker не смог: образ, сеть, демон
+    "failed to resolve reference",       # хост не достучался до docker.io
+    "oci runtime create failed",         # сломан рантайм
+    "failed to create task for container",
+    "failed to inject cdi devices",      # драйвер nvidia на хосте
+    "no space left on device",
+)
+
+
 def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, max_silent_min=12):
     """Дождаться, пока машина запустится и сервер установит модели. Возвращает Api или None.
 
@@ -295,7 +306,7 @@ def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, m
     или onstart.sh упал, — ждать полный max_setup_min бессмысленно и дорого.
     """
     start, last_msg, api = time.time(), "", None
-    silent_since, ever_answered = None, False
+    silent_since, ever_answered, dead_polls = None, False, 0
     while True:
         elapsed = (time.time() - start) / 60
         try:
@@ -310,7 +321,16 @@ def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, m
             return None
         if status != "running":
             silent_since = None
-            msg = f"  [{elapsed:4.0f} мин] машина: {status} {(inst.get('status_msg') or '')[:80]}"
+            status_msg = (inst.get("status_msg") or "").strip()
+            if any(p in status_msg.lower() for p in DEAD_MSG):
+                dead_polls += 1
+                if dead_polls >= 3:      # три опроса подряд, около минуты
+                    say(f"  Машина не смогла запустить образ: {status_msg[:160]}")
+                    say("  Это отказ хоста, а не ваша настройка — беру другую машину.")
+                    return None
+            else:
+                dead_polls = 0
+            msg = f"  [{elapsed:4.0f} мин] машина: {status} {status_msg[:80]}"
             if elapsed > max_loading_min:
                 say(f"  Машина не запустилась за {max_loading_min} мин — беру другую.")
                 return None
@@ -361,11 +381,20 @@ class _SetupFailed:
         self.api = api
 
 
-def run_session(vast, cfg, items, voice, voice_txt, args, out_dir, failed):
-    """Одна аренда: запустить машину, озвучить что успеем. Возвращает список неозвученных."""
+def run_session(vast, cfg, items, voice, voice_txt, args, out_dir, failed, skip_hosts):
+    """Одна аренда: запустить машину, озвучить что успеем. Возвращает список неозвученных.
+
+    skip_hosts — хосты, уже подводившие в этом запуске. Без них самая дешёвая, но битая
+    машина выбиралась бы снова и снова: поиск всегда возвращает её первой.
+    """
     g = cfg["gpu"]
     offers = vast.search_offers(g["names"], g["max_price_per_hour"], g["min_reliability"], g["disk_gb"],
                                 interruptible=g["interruptible"])
+    if skip_hosts:
+        before = len(offers)
+        offers = [o for o in offers if o.get("machine_id") not in skip_hosts]
+        if before != len(offers):
+            say(f"  Пропускаю {before - len(offers)} машин на хостах, уже подводивших в этом запуске.")
     if not offers:
         fail(f"нет свободных машин {', '.join(g['names'])} дешевле ${g['max_price_per_hour']}/ч "
              "с надёжностью от {:.2f}. Поднимите max_price_per_hour или добавьте модели GPU в config.yaml."
@@ -403,6 +432,9 @@ def run_session(vast, cfg, items, voice, voice_txt, args, out_dir, failed):
             save_logs(ready.api, out_dir, instance_id)
             fail("установка на сервере не удалась. Пришлите файл с логами — по нему видно, что исправить.")
         if ready is None:
+            host = offer.get("machine_id")
+            if host:
+                skip_hosts.add(host)
             return remaining, False
         api = ready
 
@@ -519,12 +551,13 @@ def main():
         return
 
     vast = Vast(find_api_key(cfg.get("vast_api_key", "")))
-    remaining, failed = items, []
+    remaining, failed, skip_hosts = items, [], set()
     try:
         for session in range(1, 4):
             if session > 1:
                 say(f"\n=== Попытка {session}: беру другую машину для {len(remaining)} сценариев ===")
-            remaining, _finished = run_session(vast, cfg, remaining, voice, voice_txt, args, out_dir, failed)
+            remaining, _finished = run_session(vast, cfg, remaining, voice, voice_txt, args,
+                                               out_dir, failed, skip_hosts)
             if not remaining:
                 break
     except KeyboardInterrupt:

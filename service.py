@@ -56,6 +56,7 @@ class Service:
         self.order = []                     # порядок поступления
         self.lock = threading.Lock()
         self.machine = None                 # что сейчас арендовано
+        self.bad_hosts = set()              # хосты, не сумевшие запустить образ
         self.repo_checked = False
         self.stopping = threading.Event()
         threading.Thread(target=self._worker, daemon=True).start()
@@ -178,7 +179,7 @@ class Service:
 
         vast = Vast(cli.find_api_key(cfg.get("vast_api_key", "")))
         token = uuid.uuid4().hex + uuid.uuid4().hex
-        instance_id, rate, gpu = self._rent(vast, token)
+        instance_id, rate, gpu, host = self._rent(vast, token)
         self.machine = {"id": instance_id, "rate": rate, "gpu": gpu,
                         "started": time.time(), "stage": "установка"}
         started = time.time()
@@ -189,6 +190,8 @@ class Service:
                 self._fail_queued("установка на сервере не удалась, логи в папке output")
                 return
             if ready is None:
+                if host:
+                    self.bad_hosts.add(host)
                 self._return_to_queue("машина не поднялась")
                 return
             self.machine["stage"] = "работает"
@@ -201,6 +204,8 @@ class Service:
         g = self.cfg["gpu"]
         offers = vast.search_offers(g["names"], g["max_price_per_hour"], g["min_reliability"],
                                     g["disk_gb"], interruptible=g["interruptible"])
+        # Поиск всегда возвращает самую дешёвую первой — без отсева битый хост берётся снова
+        offers = [o for o in offers if o.get("machine_id") not in self.bad_hosts]
         if not offers:
             raise VastError(f"нет свободных машин {', '.join(g['names'])} дешевле "
                             f"${g['max_price_per_hour']}/ч")
@@ -219,7 +224,7 @@ class Service:
                 continue
             rate = price if g["interruptible"] else offer.get("dph_total", 0)
             say(f"  Арендована машина {instance_id}: {offer.get('gpu_name')}, ${rate:.3f}/ч")
-            return instance_id, rate, offer.get("gpu_name")
+            return instance_id, rate, offer.get("gpu_name"), offer.get("machine_id")
         raise VastError("не удалось арендовать ни одну из подходящих машин")
 
     def _pump(self, api, vast, instance_id, started):
@@ -308,6 +313,7 @@ class Service:
                 with self.lock:
                     self._set(self.jobs[job_id], status="failed", stage="ошибка", error=rj["error"])
                 say(f"  ✖ {job_id}: {rj['error']}")
+                cli.save_logs(api, out_dir, f"{name}_{lang}")   # версии библиотек видны только там
             elif rj["status"] == "done":
                 out = out_dir / f"{name}_{lang}.{self.cfg['output_format']}"
                 out.write_bytes(audio)

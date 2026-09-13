@@ -12,7 +12,10 @@ VENVS = Path(os.environ.get("VENVS_DIR", "/workspace/venvs"))
 LOG_DIR = Path(os.environ.get("TTS_HOME", "/workspace/tts")) / "logs"
 
 PACKAGES = {
-    "qwen": ["faster-qwen3-tts==0.4.0", "soundfile"],
+    # transformers пиньуем жёстко: faster-qwen3-tts 0.4.0 собрана 2026-08-25 против 5.15.1,
+    # а в 5.16+ у MimiConfig убрали rope_theta и модель перестаёт загружаться:
+    # AttributeError: 'MimiConfig' object has no attribute 'rope_theta'
+    "qwen": ["faster-qwen3-tts==0.4.0", "transformers==5.15.1", "soundfile"],
     "voxcpm": ["voxcpm==2.0.3", "soundfile"],
 }
 

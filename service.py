@@ -10,6 +10,7 @@
 готовность спрашивается через GET /tts/{id}, аудио забирается через GET /tts/{id}/audio.
 """
 import argparse
+import atexit
 import sys
 import threading
 import time
@@ -56,7 +57,9 @@ class Service:
         self.order = []                     # порядок поступления
         self.lock = threading.Lock()
         self.machine = None                 # что сейчас арендовано
-        self.bad_hosts = set()              # хосты, не сумевшие запустить образ
+        self.bad_hosts = cli.load_bad_hosts()   # переживает перезапуск сервиса
+        self.rental = None                  # активная аренда, чтобы удалить её при остановке
+        self.rental_lock = threading.Lock()
         self.repo_checked = False
         self.stopping = threading.Event()
         threading.Thread(target=self._worker, daemon=True).start()
@@ -180,9 +183,11 @@ class Service:
         vast = Vast(cli.find_api_key(cfg.get("vast_api_key", "")))
         token = uuid.uuid4().hex + uuid.uuid4().hex
         instance_id, rate, gpu, host = self._rent(vast, token)
-        self.machine = {"id": instance_id, "rate": rate, "gpu": gpu,
-                        "started": time.time(), "stage": "установка"}
         started = time.time()
+        with self.rental_lock:
+            self.rental = {"vast": vast, "id": instance_id, "rate": rate, "started": started}
+        self.machine = {"id": instance_id, "rate": rate, "gpu": gpu,
+                        "started": started, "stage": "установка"}
         try:
             ready = cli.wait_ready(vast, instance_id, token)
             if isinstance(ready, cli._SetupFailed):
@@ -192,13 +197,14 @@ class Service:
             if ready is None:
                 if host:
                     self.bad_hosts.add(host)
+                    cli.remember_bad_host(host, "машина не поднялась")
                 self._return_to_queue("машина не поднялась")
                 return
             self.machine["stage"] = "работает"
             self._pump(ready, vast, instance_id, started)
         finally:
             self.machine = None
-            self._destroy(vast, instance_id, rate, started)
+            self._destroy()
 
     def _rent(self, vast, token):
         g = self.cfg["gpu"]
@@ -325,17 +331,36 @@ class Service:
                 say(f"  ✔ {job_id}: {out.name} ({report['duration']}), "
                     f"под вопросом: {report['flagged_count']}")
 
-    def _destroy(self, vast, instance_id, rate, started):
-        hours = (time.time() - started) / 3600
+    def _destroy(self):
+        """Удалить арендованную машину. Безопасно вызывать повторно и из обработчика выхода."""
+        with self.rental_lock:
+            r, self.rental = self.rental, None
+        if not r:
+            return
+        hours = (time.time() - r["started"]) / 3600
         for _ in range(5):
             try:
-                vast.destroy(instance_id)
-                say(f"  Машина {instance_id} удалена. {hours:.2f} ч, примерно ${hours * rate:.2f}")
+                r["vast"].destroy(r["id"])
+                say(f"  Машина {r['id']} удалена. {hours:.2f} ч, примерно ${hours * r['rate']:.2f}")
                 return
             except Exception as exc:  # noqa: BLE001
                 say(f"  Не удалось удалить машину ({exc}), повтор…")
                 time.sleep(5)
-        say(f"  !!! Машину {instance_id} удалить не удалось. Запустите 5_cleanup.bat")
+        say(f"  !!! Машину {r['id']} удалить не удалось. Запустите 5_cleanup.bat")
+
+    def shutdown(self):
+        """Остановка сервиса: машину надо снять с аренды, иначе она тратит деньги дальше.
+
+        Рабочий поток — демон, при выходе процесса его finally может не успеть выполниться,
+        поэтому удаление вызывается ещё и отсюда: из atexit и после остановки uvicorn.
+        """
+        self.stopping.set()
+        with self.rental_lock:
+            pending = self.rental is not None
+        if pending:
+            say("")
+            say("Остановка сервиса: снимаю машину с аренды…")
+        self._destroy()
 
 
 def voice_files(name):
@@ -483,11 +508,17 @@ def main():
 
     service = Service(cfg, api_cfg)
     app = build_app(service, api_cfg)
+    atexit.register(service.shutdown)   # страховка на случай выхода мимо uvicorn
     say(f"\nAPI озвучки: http://{api_cfg['host']}:{api_cfg['port']}")
     say(f"  токен: {'задан' if api_cfg['token'] else 'не нужен (только этот компьютер)'}")
     say(f"  машина удаляется после {api_cfg['idle_minutes']:.0f} мин простоя")
+    if service.bad_hosts:
+        say(f"  пропускаю {len(service.bad_hosts)} хостов, подводивших за последнюю неделю")
     say("  документация: /docs\n")
-    uvicorn.run(app, host=api_cfg["host"], port=int(api_cfg["port"]), log_level="warning")
+    try:
+        uvicorn.run(app, host=api_cfg["host"], port=int(api_cfg["port"]), log_level="warning")
+    finally:
+        service.shutdown()              # Ctrl+C: uvicorn гасится, машину снимаем здесь
 
 
 if __name__ == "__main__":

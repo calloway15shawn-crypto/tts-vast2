@@ -5,6 +5,7 @@
     py run.py --test       — пробный запуск на дешёвой машине без моделей (проверка связки)
 """
 import argparse
+import json
 import re
 import secrets
 import sys
@@ -147,6 +148,47 @@ def estimate(items, cfg):
     price = cfg["gpu"]["max_price_per_hour"]
     say(f"\n  Всего аудио: ~{audio_min:.0f} мин. Работа машины: ~{hours:.1f} ч (включая ~{setup_min} мин установки).")
     say(f"  Стоимость: не больше ~${hours * price:.2f} при лимите ${price}/ч (обычно дешевле).")
+
+
+# ---------------------------------------------------------------- память о плохих хостах
+
+BAD_HOSTS_FILE = ROOT / ".bad_hosts.json"
+BAD_HOST_TTL_DAYS = 7      # через неделю хост снова считается годным: у Vast всё чинится
+
+
+def load_bad_hosts():
+    """Хосты, подводившие в прошлые запуски. Память переживает перезапуск программы."""
+    try:
+        data = json.loads(BAD_HOSTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    fresh, now = set(), time.time()
+    for host, rec in (data if isinstance(data, dict) else {}).items():
+        if now - ((rec or {}).get("when") or 0) < BAD_HOST_TTL_DAYS * 86400:
+            try:
+                fresh.add(int(host))
+            except (TypeError, ValueError):
+                continue
+    return fresh
+
+
+def remember_bad_host(host, reason=""):
+    """Записать хост на диск, чтобы он не выбирался и после перезапуска."""
+    if not host:
+        return
+    try:
+        data = json.loads(BAD_HOSTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[str(host)] = {"when": time.time(), "reason": (reason or "")[:200]}
+    try:
+        tmp = BAD_HOSTS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(BAD_HOSTS_FILE)
+    except OSError as exc:
+        say(f"  (не удалось запомнить хост {host}: {exc})")
 
 
 # ---------------------------------------------------------------- проверка репозитория
@@ -435,6 +477,7 @@ def run_session(vast, cfg, items, voice, voice_txt, args, out_dir, failed, skip_
             host = offer.get("machine_id")
             if host:
                 skip_hosts.add(host)
+                remember_bad_host(host, "машина не поднялась")
             return remaining, False
         api = ready
 
@@ -551,7 +594,10 @@ def main():
         return
 
     vast = Vast(find_api_key(cfg.get("vast_api_key", "")))
-    remaining, failed, skip_hosts = items, [], set()
+    remaining, failed, skip_hosts = items, [], load_bad_hosts()
+    if skip_hosts:
+        say()
+        say(f"Пропущу {len(skip_hosts)} хостов, подводивших за последние {BAD_HOST_TTL_DAYS} дней.")
     try:
         for session in range(1, 4):
             if session > 1:

@@ -138,13 +138,15 @@ def split_chunks(text, max_chars=300, min_chars=60):
 
 
 def norm_words(s):
-    """Нормализация для сравнения: нижний регистр, ё→е, без пунктуации."""
+    """Нормализация для сравнения: нижний регистр, ё→е, без пунктуации и знаков ударения."""
     s = unicodedata.normalize("NFKC", s).lower().replace("ё", "е")
     out = []
     for ch in s:
         cat = unicodedata.category(ch)
         if cat.startswith("L") or cat.startswith("N"):
             out.append(ch)
+        elif cat == "Mn":
+            continue          # знак ударения: на сравнение не влияет, слово не разрывает
         elif ch in "'’ʼ":
             continue
         else:

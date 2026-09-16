@@ -11,6 +11,7 @@
 """
 import argparse
 import atexit
+import json
 import sys
 import threading
 import time
@@ -36,8 +37,8 @@ API_DEFAULTS = {
     "host": "127.0.0.1",       # 0.0.0.0 — открыть для других компьютеров (тогда нужен token)
     "port": 8800,
     "token": "",
-    "idle_minutes": 10,        # сколько держать машину без работы, прежде чем удалить
-    "max_session_hours": 6,    # предохранитель: сессия дольше — машина удаляется
+    "idle_minutes": 25,        # сколько держать машину без работы, прежде чем удалить
+    "max_session_hours": 10,   # предохранитель: сессия дольше — машина удаляется
     "max_tries": 3,            # сколько раз пробовать задачу на новых машинах
 }
 
@@ -55,14 +56,56 @@ class Service:
         self.cfg, self.api_cfg = cfg, api_cfg
         self.jobs = {}                      # id -> запись задачи
         self.order = []                     # порядок поступления
-        self.lock = threading.Lock()
+        # Рекурсивный: _set вызывается из блоков, которые уже держат замок,
+        # а сохранение очереди берёт его снова.
+        self.lock = threading.RLock()
         self.machine = None                 # что сейчас арендовано
+        self.state_file = ROOT / "output" / ".queue.json"
         self.bad_hosts = cli.load_bad_hosts()   # переживает перезапуск сервиса
         self.rental = None                  # активная аренда, чтобы удалить её при остановке
         self.rental_lock = threading.Lock()
         self.repo_checked = False
         self.stopping = threading.Event()
+        self._restore()
         threading.Thread(target=self._worker, daemon=True).start()
+
+    # ---------- очередь на диске ----------
+    def _save(self) -> None:
+        """Сложить очередь на диск: пачка из десяти роликов идёт часами, и
+        перезапуск сервиса не должен означать потерю всего сделанного."""
+        try:
+            with self.lock:
+                данные = [self.jobs[i] for i in self.order]
+            tmp = self.state_file.with_suffix(".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(данные, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.state_file)
+        except OSError as exc:
+            say(f"  (не удалось сохранить очередь: {exc})")
+
+    def _restore(self) -> None:
+        """Поднять очередь с диска. Незаконченное возвращается в очередь: сервер
+        на машине считает номер задачи от содержимого, поэтому повторная отправка
+        того же текста не создаёт дубля и не переозвучивает заново."""
+        try:
+            данные = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        готово = снова = 0
+        for j in данные if isinstance(данные, list) else []:
+            jid = j.get("id")
+            if not jid:
+                continue
+            if j.get("status") == "running":
+                j["status"], j["stage"] = "queued", "в очереди (после перезапуска)"
+                снова += 1
+            elif j.get("status") == "done":
+                готово += 1
+            self.jobs[jid] = j
+            self.order.append(jid)
+        if self.jobs:
+            say(f"  Очередь восстановлена: {len(self.jobs)} задач "
+                f"(готово {готово}, вернулось в очередь {снова})")
 
     # ---------- то, что видит HTTP-слой ----------
     def add(self, name, lang, text, voice, settings):
@@ -77,6 +120,7 @@ class Service:
                 "audio": None, "report": None,
             }
             self.order.append(job_id)
+        self._save()
         return self.public(job_id)
 
     def public(self, job_id):
@@ -130,6 +174,7 @@ class Service:
     # ---------- внутреннее ----------
     def _set(self, job, **fields):
         job.update(fields, updated=time.time())
+        self._save()
 
     def _queued_ids(self):
         with self.lock:

@@ -39,6 +39,11 @@ def preflight(raw, lang):
         if DIGIT_RE.search(line):
             frag = _around(line, DIGIT_RE.search(line).start())
             errors.append(f"строка {no}: цифры «{frag}» — напишите числа словами в нужном падеже")
+        if any(unicodedata.category(ch) == "Mn" for ch in line):
+            warnings.append(
+                f"строка {no}: знаки ударения — Qwen3-TTS произносит их как лишний звук "
+                "(«за́мок» читается «заумок»), уберите их"
+            )
         for m in ROMAN_RE.finditer(line):
             warnings.append(f"строка {no}: римские цифры «{m.group(0)}» — лучше написать словами")
         if lang in ("ru",):

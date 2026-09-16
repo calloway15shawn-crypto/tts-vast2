@@ -16,3 +16,11 @@ __pycache__/
 tema_ru.txt
 .job_id
 .bad_hosts.json
+
+# Сценарии и рабочие тексты — это ваш контент, репозиторий публичный
+scripts/*.txt
+!scripts/example_ru.txt
+scripts/**/
+*_готов.txt
+*_было.txt
+.jobs

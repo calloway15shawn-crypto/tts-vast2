@@ -5,9 +5,11 @@
     py run.py --test       — пробный запуск на дешёвой машине без моделей (проверка связки)
 """
 import argparse
+import base64
 import json
 import re
 import secrets
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,14 +34,47 @@ VOICE_EXT = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
 SPEED = {"qwen": 3.0, "voxcpm": 1.2}
 CHARS_PER_SEC = 14.0
 
+# Скачивание кода на машину. Идёт до onstart.sh, когда в образе ещё может не быть git,
+# а apt на хосте — не работать. Поэтому запасной путь: архив с GitHub через python,
+# который в образе есть всегда.
+FETCH_CODE = """
+import io, os, tarfile, urllib.request
+
+repo = os.environ["GITHUB_REPO"]
+branch = os.environ["GITHUB_BRANCH"]
+token = os.environ.get("GITHUB_TOKEN", "").strip()
+url = "https://codeload.github.com/%s/tar.gz/refs/heads/%s" % (repo, branch)
+req = urllib.request.Request(url)
+if token:
+    req.add_header("Authorization", "Bearer " + token)
+print("[fetch] качаю архив " + url, flush=True)
+data = urllib.request.urlopen(req, timeout=300).read()
+tar = tarfile.open(fileobj=io.BytesIO(data))
+top = tar.getnames()[0].split("/")[0]
+try:
+    tar.extractall("/workspace", filter="data")
+except TypeError:      # python до 3.12: параметра filter ещё нет
+    tar.extractall("/workspace")
+os.rename("/workspace/" + top, "/workspace/app")
+print("[fetch] код распакован в /workspace/app", flush=True)
+"""
+
+_FETCH_B64 = base64.b64encode(FETCH_CODE.encode()).decode()
+
+# Вывод дублируется в stdout контейнера (tee): только оттуда его можно забрать через Vast,
+# когда API на машине так и не поднялся.
 ONSTART = (
-    "bash -c 'mkdir -p /workspace && cd /workspace && "
-    "(command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git)) && "
-    "if [ ! -d app ]; then "
-    "if [ -n \"$GITHUB_TOKEN\" ]; then "
-    "git clone --depth 1 -b \"$GITHUB_BRANCH\" \"https://x-access-token:$GITHUB_TOKEN@github.com/$GITHUB_REPO.git\" app; "
-    "else git clone --depth 1 -b \"$GITHUB_BRANCH\" \"https://github.com/$GITHUB_REPO.git\" app; fi; fi && "
-    "bash app/server/onstart.sh' > /workspace/onstart.log 2>&1"
+    "bash -c '"
+    "mkdir -p /workspace && cd /workspace && "
+    "PY=\"$(command -v python || echo /opt/conda/bin/python)\"; "
+    "if [ ! -d app ] && command -v git >/dev/null 2>&1; then "
+    "git clone --depth 1 -b \"$GITHUB_BRANCH\" "
+    "\"https://${GITHUB_TOKEN:+x-access-token:$GITHUB_TOKEN@}github.com/$GITHUB_REPO.git\" app "
+    "|| echo \"[onstart] git clone не удался, пробую архивом\"; fi; "
+    "if [ ! -d app ]; then echo " + _FETCH_B64 + " | base64 -d > fetch.py && \"$PY\" fetch.py; fi; "
+    "if [ ! -d app ]; then echo \"[onstart] ОШИБКА: код с GitHub не скачался\"; exit 1; fi; "
+    "bash app/server/onstart.sh"
+    "' 2>&1 | tee /workspace/onstart.log"
 )
 
 
@@ -264,6 +299,34 @@ def check_repo(cfg):
         fail(f"в репозитории {repo} не хватает файлов server/: {', '.join(missing)}. "
              "Загрузите папку server заново — без них сервер на машине не запустится.")
     say(f"  GitHub: {repo}, ветка {branch} — код на месте ({len(local)} файлов в server/)")
+    stale = _stale_server_files(listing)
+    if stale:
+        say(f"  ! На GitHub лежит другая версия файлов server/: {', '.join(stale)}")
+        say("    Машина берёт код именно оттуда, поэтому локальные правки не применятся — "
+            "загрузите эти файлы в репозиторий заново.")
+
+
+def _stale_server_files(listing):
+    """Файлы server/, которые на GitHub отличаются от локальных.
+
+    Сравниваем по хешу git: GitHub отдаёт его в листинге, а локальный считает
+    `git hash-object` — он же приводит переводы строк по .gitattributes.
+    Нет git или он споткнулся — молча пропускаем: это лишь предупреждение.
+    """
+    remote = {x.get("name"): x.get("sha") for x in listing if x.get("type") == "file"}
+    names = sorted(n for n in remote
+                   if Path(n).suffix in SERVER_EXT and (ROOT / "server" / n).exists())
+    if not names:
+        return []
+    try:
+        done = subprocess.run(["git", "hash-object", "--", *(f"server/{n}" for n in names)],
+                              cwd=ROOT, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    local = done.stdout.split()
+    if done.returncode != 0 or len(local) != len(names):
+        return []
+    return [n for n, sha in zip(names, local) if remote[n] != sha]
 
 
 # ---------------------------------------------------------------- работа с сервером
@@ -316,6 +379,38 @@ def save_logs(api, out_dir, tag):
         say(f"  Не удалось скачать логи: {exc}")
 
 
+# Токен GitHub попадает в адрес, который git печатает при неудачном клоне. Лог уходит
+# в файл и на экран, поэтому вырезаем секреты до показа.
+SECRET_RE = re.compile(r"(x-access-token:)[^@\s]+|(gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+
+
+def _hide_secrets(text):
+    return SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", text)
+
+
+def save_container_logs(vast, instance_id, out_dir=None, lines=30):
+    """Показать и сохранить вывод машины, когда API на ней не поднялся."""
+    say("  Забираю вывод машины через Vast, чтобы увидеть, на чём всё встало…")
+    try:
+        text = vast.container_logs(instance_id)
+    except Exception as exc:  # noqa: BLE001
+        say(f"  Vast не отдал вывод машины: {exc}")
+        return
+    if not text.strip():
+        say("  Vast вернул пустой вывод машины.")
+        return
+    text = _hide_secrets(text)
+    tail = [ln for ln in text.splitlines() if ln.strip()][-lines:]
+    say("  --- последние строки с машины ---")
+    for ln in tail:
+        say(f"  | {ln[:200]}")
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"логи_машины_{instance_id}.txt"
+        path.write_text(text, encoding="utf-8")
+        say(f"  --- целиком: {path}")
+
+
 def write_report(report, path):
     lines = [f"Озвучка: {report['name']}_{report['lang']} (движок {report['engine']})",
              f"Длительность: {report['duration']}, фрагментов: {report['fragments']}",
@@ -339,7 +434,14 @@ DEAD_MSG = (
 )
 
 
-def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, max_silent_min=12):
+# Скачивание образа, которое перестало двигаться. Ошибки при этом нет: Vast
+# показывает последнюю строку docker pull и молчит, поэтому распознаём по
+# застывшему сообщению, а не по его содержимому.
+MAX_STALL_MIN = 7
+
+
+def wait_ready(vast, instance_id, token, out_dir=None, max_setup_min=50, max_loading_min=20,
+               max_silent_min=12, max_stall_min=MAX_STALL_MIN):
     """Дождаться, пока машина запустится и сервер установит модели. Возвращает Api или None.
 
     max_setup_min  — общий предел: сервер отвечает, но долго ставит модели.
@@ -349,6 +451,7 @@ def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, m
     """
     start, last_msg, api = time.time(), "", None
     silent_since, ever_answered, dead_polls = None, False, 0
+    last_status_msg, stalled_since = None, None
     while True:
         elapsed = (time.time() - start) / 60
         try:
@@ -360,6 +463,7 @@ def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, m
         status = inst.get("actual_status") or "created"
         if status in ("exited", "offline") or inst.get("intended_status") == "stopped":
             say(f"  Машина остановилась ({status}): {inst.get('status_msg') or ''}")
+            save_container_logs(vast, instance_id, out_dir)
             return None
         if status != "running":
             silent_since = None
@@ -372,6 +476,13 @@ def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, m
                     return None
             else:
                 dead_polls = 0
+            if status_msg != last_status_msg:
+                last_status_msg, stalled_since = status_msg, time.time()
+            elif stalled_since and (time.time() - stalled_since) / 60 > max_stall_min:
+                say(f"  Загрузка образа стоит {max_stall_min} мин без движения: "
+                    f"{status_msg[:120]}")
+                say("  Хост не тянет образ — беру другую машину.")
+                return None
             msg = f"  [{elapsed:4.0f} мин] машина: {status} {status_msg[:80]}"
             if elapsed > max_loading_min:
                 say(f"  Машина не запустилась за {max_loading_min} мин — беру другую.")
@@ -391,11 +502,9 @@ def wait_ready(vast, instance_id, token, max_setup_min=50, max_loading_min=20, m
                         if ever_answered:
                             say(f"  Сервер молчит больше {max_silent_min} мин — беру другую машину.")
                         else:
-                            say(f"  Сервер не ответил ни разу за {max_silent_min} мин. Обычно это значит, "
-                                "что код с GitHub не скачался или onstart.sh упал на установке пакетов. "
-                                "Логи остались на машине в /workspace/onstart.log, но API не поднялся, "
-                                "поэтому скачать их нельзя: чтобы разобраться по SSH, запустите "
-                                "с ключом --keep (машина не будет удалена).")
+                            say(f"  Сервер не ответил ни разу за {max_silent_min} мин: код с GitHub "
+                                "не скачался или onstart.sh упал на установке пакетов.")
+                        save_container_logs(vast, instance_id, out_dir)
                         return None
                     msg = f"  [{elapsed:4.0f} мин] запуск сервера, молчит {silent:.0f} из {max_silent_min} мин"
                 else:
@@ -469,7 +578,7 @@ def run_session(vast, cfg, items, voice, voice_txt, args, out_dir, failed, skip_
     started = time.time()
     remaining = list(items)
     try:
-        ready = wait_ready(vast, instance_id, token)
+        ready = wait_ready(vast, instance_id, token, out_dir)
         if isinstance(ready, _SetupFailed):
             save_logs(ready.api, out_dir, instance_id)
             fail("установка на сервере не удалась. Пришлите файл с логами — по нему видно, что исправить.")

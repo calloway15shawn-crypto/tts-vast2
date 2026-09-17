@@ -1,6 +1,7 @@
 """Минимальный клиент REST API Vast.ai (без установки vastai CLI)."""
 import json
 import os
+import time
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -82,6 +83,25 @@ class Vast:
     def instance(self, instance_id):
         r = self.s.get(self._url(f"/api/v0/instances/{instance_id}/", {"owner": "me"}), timeout=30)
         return self._check(r).get("instances")
+
+    def container_logs(self, instance_id, tail=600):
+        """Вывод контейнера машины: то, что напечатал onstart.
+
+        Единственный способ увидеть ошибку, когда API на машине не поднялся.
+        Vast готовит файл с логом не сразу, поэтому ссылку опрашиваем по кругу.
+        """
+        r = self.s.put(self._url(f"/api/v0/instances/request_logs/{instance_id}/"),
+                       json={"tail": str(tail)}, timeout=30)
+        url = self._check(r).get("result_url")
+        if not url:
+            return ""
+        for _ in range(40):
+            # без сессии: ссылка уже подписана, лишний заголовок Authorization её ломает
+            got = requests.get(url, timeout=30)
+            if got.status_code == 200 and got.text.strip():
+                return got.text
+            time.sleep(1)
+        return ""
 
     def destroy(self, instance_id):
         return self._check(self.s.delete(self._url(f"/api/v0/instances/{instance_id}/"), json={}, timeout=30))

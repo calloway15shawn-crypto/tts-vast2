@@ -234,7 +234,7 @@ class Service:
         self.machine = {"id": instance_id, "rate": rate, "gpu": gpu,
                         "started": started, "stage": "установка"}
         try:
-            ready = cli.wait_ready(vast, instance_id, token)
+            ready = cli.wait_ready(vast, instance_id, token, ROOT / "output")
             if isinstance(ready, cli._SetupFailed):
                 cli.save_logs(ready.api, ROOT / "output", str(instance_id))
                 self._fail_queued("установка на сервере не удалась, логи в папке output")

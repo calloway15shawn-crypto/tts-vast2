@@ -11,6 +11,8 @@ voices/*.txt
 # Результаты работы и мусор
 output/
 __pycache__/
+api.out.log
+api.err.log
 *.pyc
 1.txt
 tema_ru.txt
